@@ -25,7 +25,7 @@ Install dependencies:
 pip install torch torchvision torchaudio pytorch-lightning torchinfo pyyaml
 
 
-##**Reference** 
+### **Reference** 
 Our AudioMae model is referenced from the github link below and developed for our use. 
 Facebook AudioMae: https://github.com/facebookresearch/AudioMAE/tree/main
 
