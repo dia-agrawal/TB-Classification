@@ -28,6 +28,9 @@ import yaml
 from tqdm import tqdm
 import json
 from pathlib import Path
+from sklearn.manifold import TSNE
+from sklearn.cluster import KMeans
+
 
 # Add the Audio_mae path
 sys.path.append('Audio_mae')
@@ -110,65 +113,8 @@ class AudioInferenceEngine:
         
         return model
     
-    def predict_single(self, audio_path):
-        """
-        Perform inference on a single audio file.
-        
-        Args:
-            audio_path (str): Path to the audio file (.pt format)
-            
-        Returns:
-            dict: Prediction results
-        """
-        try:
-            # Load audio data
-            mel = torch.load(audio_path)
-            mel = mel[:, 1:]  # Remove first column
-            mel = F.pad(input=mel, pad=(0, 0, 0, 59), mode='constant', value=0)
-            mel = mel.unsqueeze(0).to(self.device)  # Add batch dimension
-            # Ensure float32 precision to match model parameters
-            mel = mel.float()
-            
-            with torch.no_grad():
-                if self.mode == 'classifier':
-                    # Get logits and probabilities
-                    logits = self.model.model.forward_encoder_nomasking_classification(mel)
-                    probabilities = F.softmax(logits, dim=1)
-                    predicted_class = torch.argmax(logits, dim=1).item()
-                    confidence = torch.max(probabilities, dim=1)[0].item()
-                                        
-                    
-                    
-                    return {
-                        'predicted_class': predicted_class,
-                        'confidence': confidence,
-                        'probabilities': probabilities.cpu().numpy()[0],
-                        'logits': logits.cpu().numpy()[0]
-                    }
-                
-                elif self.mode == 'tripletloss':
-                    # Get embeddings
-                    embeddings = self.model.model.forward_encoder_nomasking(mel)
-                                        
-                    return {
-                        'embeddings': embeddings.cpu().numpy()[0],
-                        'embedding_norm': torch.norm(embeddings, dim=1).item()
-                    }
-                
-                elif self.mode == 'auto':
-                    # Get reconstruction
-                    loss, pred, mask = self.model.model(mel, mask_ratio=0.8)
-                    return {
-                        'reconstruction_loss': loss.item(),
-                        'prediction': pred.cpu().numpy(),
-                        'mask': mask.cpu().numpy()
-                    }
-        
-        except Exception as e:
-            print(f"Error processing {audio_path}: {e}")
-            return None
     
-    def predict_batch(self, audio_paths, batch_size=32):
+    def predict_ifiles(self, audio_paths, size=32):
         """
         Perform batch inference on multiple audio files.
         
@@ -181,20 +127,60 @@ class AudioInferenceEngine:
         """
         results = []
         
-        for i in tqdm(range(0, len(audio_paths), batch_size), desc="Processing batches"):
-            batch_paths = audio_paths[i:i + batch_size]
+        for i in tqdm(range(0, len(audio_paths), size), desc="Processing batches"):
+            batch_paths = audio_paths[i:i + size]
             batch_results = []
             
             for path in batch_paths:
-                result = self.predict_single(path)
-                if result is not None:
-                    result['file_path'] = path
-                    batch_results.append(result)
-            
+                try:
+                    mel = self._preprocess(path)
+                    
+                    with torch.no_grad():
+                        if self.mode in 'classifier':
+                            # Get logits and probabilities
+                            logits = self.model.model.forward_encoder_nomasking_classification(mel)
+                            probabilities = F.softmax(logits, dim=1)
+                            predicted_class = torch.argmax(logits, dim=1).item()
+                            confidence = torch.max(probabilities, dim=1)[0].item()
+                            
+                            result = {
+                                'predicted_class': predicted_class,
+                                'confidence': confidence,
+                                'probabilities': probabilities.cpu().numpy()[0],
+                                'logits': logits.cpu().numpy()[0], 
+                                'file_path': path
+                            }
+                                                
+                        elif self.mode == 'tripletloss': 
+                            emb = self.model.model.forward_encoder_nomasking(mel).cpu().numpy()[0]
+                            norm = float(np.linalg.norm(emb))
+                            
+                            result = {
+                                'embedding': emb,
+                                'file_path': path, 
+                                'embedding_norm': norm, 
+                            
+                            } 
+                        else: 
+                            loss, pred, mask = self.model.model(mel, mask_ratio=0.8)
+                            result = {
+                                'file_path':path, 
+                                'reconstruction_loss': loss.item(),
+                                'prediction': pred.cpu().numpy(),
+                                'mask': mask.cpu().numpy()
+                            }
+                except Exception as e:
+                    print(f"Error processing {path}: {e}")
+                    continue
+                
+                batch_results.append(result)
             results.extend(batch_results)
-        
+            
         return results
 
+    def _preprocess(self, path): 
+        mel = torch.load(path)[:,1:]
+        return F.pad(mel,(0,0,0,59)).unsqueeze(0).float().to(self.device)
 
 class AudioEvaluator:
     """Evaluator for assessing model performance."""
@@ -215,8 +201,11 @@ class AudioEvaluator:
     
     def load_test_data(self):
         """Load test data for evaluation."""
-        if self.mode == 'classifier':
+        if self.mode in ('classifier' ,'tripletloss'):
             # Load classifier test data
+            # Input data, labels, file_path
+            # classify and evaluate on patient level
+            # ROC curve on patient level and collect multiple statistics
             good_dir = os.path.join(self.test_data_path, 'good')  #.
             bad_dir = os.path.join(self.test_data_path, 'bad')    #.
             
@@ -225,15 +214,10 @@ class AudioEvaluator:
                 data_dir_good=[good_dir],
                 data_dir_bad=[bad_dir],
                 apply_specaugment=False,
+                extend_bad=False,
                 shuffle=False
             )
 
-        elif self.mode == 'tripletloss':
-            test_ds = AudioDataset(
-                mode='triplet',
-                data_dir_good=[os.path.join(self.test_data_path, 'good')],
-                data_dir_bad=[os.path.join(self.test_data_path, 'bad')]
-            )
         else:
             test_ds = AudioDataset(
                 mode='auto',
@@ -241,161 +225,195 @@ class AudioEvaluator:
             )
         return test_ds
     
-    def evaluate_knn(self, test_ds, X_ref, Y_ref, K=5):
-        """Evaluate triplet loss performance using KNN"""
-        print("Evaluating triplet loss performance using KNN...")
+    def evaluate_kMeansCluster(self,
+                           test_ds,
+                           X_ref,           # shape: (N_ref, D)
+                           Y_ref,           # shape: (N_ref,)
+                           n_clusters=10,
+                           threshold=0.5,
+                           patient_result=False,
+                           run_mj=False,    # toggle KNN majority-rule
+                           K=5):
+        """K-Means clustering + optional KNN majority-rule baseline."""
+        print("Evaluating triplet loss performance using kMeansCluster...")
 
-        knn_predictions = []
-        knn_ground_truth = []
-        
-        test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=4)
-        self.model_engine.model.eval()
-        
-        with torch.no_grad():
-            for BatchOfMels, BatchOfLabels, _ in test_loader: 
-                BatchOfMels = BatchOfMels.to(self.model_engine.device).float()         # [1,1,256,256]
-                BatchOfEmb = self.model_engine.model.model.forward_encoder_nomasking(BatchOfMels)  # [1,D]
-                BatchOfEmb = BatchOfEmb.cpu().numpy()
-                BatchOfLabels = BatchOfLabels.cpu().numpy()
-                
-                for query, true_label in zip(BatchOfEmb, BatchOfLabels):
-                    # print(X_ref.shape)
-                    # print(query.shape)
-                    euc_distance = np.linalg.norm(X_ref - query, axis=1) 
-                #[[D_mel1] - [d], [D_mel2] - [d], ...]
-                
-                #finding k nearest neighbor: 
-                    knn_idx = np.argsort(euc_distance)
-                    knn_idx = knn_idx[:K] #using only the fist K values (first K=5 smallest values)
-                    knn_idx_labels = Y_ref[knn_idx]
-                
-                    pred = int(knn_idx_labels.sum() > (K/2)) 
-                #if more than half of the labels are 1, then the prediction is 1, otherwise 0
-                    knn_predictions.append(pred)
-                #append prediction to knn_predictions
-                    #print("size of me",true_label.size)
-                    knn_ground_truth.append(int(true_label))
-                #append ground truth to knn_ground_truth
-
-            acc = np.mean(np.array(knn_predictions) == np.array(knn_ground_truth))
-            
-            return {"KNN_accuracy_majority_rule": acc}
-
-    def run_knn(self, train_ds, test_ds, K=5):
-        X_ref, Y_ref = [], []
-        ref_loader = DataLoader(train_ds, batch_size=1, shuffle=False)
-
-        with torch.no_grad():
-            for anchor, positive, negative in ref_loader:
-                # anchor comes from "good" dir → label = 1
-                emb = self.model_engine.model.model.forward_encoder_nomasking(
-                            anchor.to(self.model_engine.device).float()
-                    )
-                X_ref.append(emb.squeeze(0).cpu().numpy())
-                Y_ref.append(1)
-
-                # positive is also "good" → label = 1
-                emb_p = self.model_engine.model.model.forward_encoder_nomasking(
-                            positive.to(self.model_engine.device).float()
-                    )
-                X_ref.append(emb_p.squeeze(0).cpu().numpy())
-                Y_ref.append(1)
-
-                # negative comes from "bad" → label = 0
-                emb_n = self.model_engine.model.model.forward_encoder_nomasking(
-                            negative.to(self.model_engine.device).float()
-                    )
-                X_ref.append(emb_n.squeeze(0).cpu().numpy())
-                Y_ref.append(0)
-
-        X_ref = np.stack(X_ref)     # shape: (3 * N_ref, 256)
-        Y_ref = np.array(Y_ref)     # shape: (3 * N_ref,)
-        return self.evaluate_knn(test_ds, X_ref, Y_ref, K)
-
-        
-    def evaluate_classifier(self, test_ds, patient_result=False, threshold=0.55):
-        """Evaluate classifier performance."""
-        print("Evaluating classifier performance...")
-        
-        # Create dataloader
+        # Prepare
         test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=0)
-        
-        all_predictions = []
-        all_labels = []
-        all_probabilities = []
-        
-        per_patient_predictions = dict()
-        per_patient_labels = dict()
-        per_patient_probabilities = dict()
-        
         self.model_engine.model.eval()
+
+        # Fit k-means on reference embeddings
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+        kmeans.fit(X_ref)
+        centroids = kmeans.cluster_centers_      # (n_clusters, D)
+        ref_labels = kmeans.labels_
+
+        # Map each cluster → class by majority vote over Y_ref
+        cluster2class = {}
+        clusterProb  = {}
+        for c in range(n_clusters):
+            idxs = np.where(ref_labels == c)[0]
+            p = Y_ref[idxs].mean()
+            cluster2class[c] = int(p > threshold)
+            clusterProb[c]    = p
+
+        # Accumulators
+        all_preds, all_labels, all_probs = [], [], []
+        mj_preds, mj_truth = [], []
+        all_embs, all_paths = [], []
+
+        per_patient_preds = {} 
+        per_patient_labels = {}  
+        per_patient_probs  = {}  
         
-            
-        all_file_paths = []
         with torch.no_grad():
-            for batch in tqdm(test_loader, desc="Evaluating"):                
-                if self.mode == 'classifier':
-                    mel, labels, file_path = batch
-                    mel = mel.to(self.model_engine.device).float()  # Ensure float32 precision
-                    labels = labels.to(self.model_engine.device)
-                    
-                    logits = self.model_engine.model.model.forward_encoder_nomasking_classification(mel)
-                    probabilities = F.softmax(logits, dim=1)
-                    predictions = torch.argmax(logits, dim=1)
-                    
-                    labels = labels.cpu().tolist()
-                    predictions = predictions.cpu().tolist()
-                    probabilities = probabilities.cpu().tolist()
+            for mels, labels, paths in tqdm(test_loader, desc="Evaluating kMeans"):
+                # 1) get embeddings
+                embs = self.model_engine.model.model.forward_encoder_nomasking(
+                            mels.to(self.model_engine.device).float())
+                embs_np = embs.cpu().numpy()
+                labels   = labels.cpu().tolist()
 
-                    all_predictions.extend(predictions)
-                    all_labels.extend(labels)
-                    all_probabilities.extend(probabilities)
-                    all_file_paths.extend(file_path)
-                    
-                    if patient_result:
-                        for f, p, l, pr in zip(file_path, predictions, labels, probabilities):
-                            # Extract patient ID from file path
-                            # Assuming file path structure: .../patient_id_.../filename.pt
-                            # or filename contains patient_id
-                            try:
-                                # Try to extract from filename first
-                                filename = Path(f).stem
-                                if '_' in filename:
-                                    patient_id = filename.split('_')[1]
-                                else:
-                                    # Try to extract from path
-                                    path_parts = Path(f).parts
-                                    for part in path_parts:
-                                        if part.startswith('R2D2') or (len(part) > 8 and part.isalnum()):
-                                            patient_id = part
-                                            break
-                                    else:
-                                        # Fallback: use filename as patient ID
-                                        patient_id = filename
-                                
-                                # print(f"File: {f} -> Patient ID: {patient_id} -> Label: {l} -> Prediction: {p}")
-                            except Exception as e:
-                                print(f"Error extracting patient ID from {f}: {e}")
-                                patient_id = Path(f).stem
-                            if patient_id not in per_patient_predictions:
-                                per_patient_predictions[patient_id] = [p]
-                                per_patient_labels[patient_id] = [l]
-                                per_patient_probabilities[patient_id] = [pr]
-                            else:
-                                if per_patient_labels[patient_id][-1] != l:
-                                    print (f"patient_id: {patient_id} \n predictions: {predictions} \n labels: {labels} \n probabilities: {probabilities}")
-                                    assert False, "predictions and labels are not the same"
-                                
-                                # print (f"p: {p} {p.cpu().numpy()}") # {p.cpu().numpy()[0]}")
-                                per_patient_predictions[patient_id].append(p)
-                                per_patient_labels[patient_id].append(l)
-                                per_patient_probabilities[patient_id].append(pr)
-                                
-                            
-        # if patient_result:
-        #     patient_ids = [Path(f).stem.split('_')[1] for f in all_file_paths]
+                # store
+                all_embs.extend(embs_np.tolist())
+                all_labels.extend(labels)
+                all_paths.extend(paths)
 
-                    
+                # 2) k-means assignment
+                dists = np.linalg.norm(
+                            centroids[None, :, :] - embs_np[:, None, :],
+                            axis=2
+                        )               # shape (batch, n_clusters)
+                cluster_ids = np.argmin(dists, axis=1)
+                preds = [cluster2class[c] for c in cluster_ids]
+                probs = [[1 - clusterProb[c], clusterProb[c]] for c in cluster_ids]
+
+                all_preds.extend(preds)
+                all_probs.extend(probs)
+
+                # 3) optional KNN majority-rule (inline, no external fn)
+                if run_mj:
+                    # pairwise to all X_ref
+                    d_knn = np.linalg.norm(
+                                X_ref[None, :, :] - embs_np[:, None, :],
+                                axis=2
+                            )               # shape (batch, N_ref)
+                    # take K nearest per sample
+                    idxs = np.argsort(d_knn, axis=1)[:, :K]     # (batch, K)
+                    lbls = Y_ref[idxs]                           # (batch, K)
+                    mj_batch = (lbls.sum(axis=1) > (K/2)).astype(int).tolist()
+                    mj_preds.extend(mj_batch)
+                    mj_truth.extend(labels)
+                
+                if patient_result:
+                    self.extract_patient_predictions(
+                        paths, preds, labels, probs,
+                        per_patient_preds,
+                        per_patient_labels,
+                        per_patient_probs
+                    )
+
+
+        # 4) Compute final metrics
+        results = {}
+        if run_mj:
+            mj_acc = np.mean(np.array(mj_preds) == np.array(mj_truth))
+            results['KNN_accuracy_majority_rule'] = mj_acc
+
+        km_acc = np.mean(np.array(all_preds) == np.array(all_labels))
+        results['Kmeans_cluster_accuracy'] = km_acc
+
+        emb_array = np.vstack(all_embs)
+        
+        # (You can still compute embedding_stats, pos/neg distances, etc.)
+        results['embeddings'] = emb_array
+        results['embedding_stats'] = {
+            'mean_norm': np.mean(np.linalg.norm(emb_array, axis=1)),
+            'std_norm':  np.std( np.linalg.norm(emb_array, axis=1) )
+        }
+        classifier_metrics = self.compute_classifier_statistics(
+                all_preds,
+                all_labels,
+                all_probs,
+                per_patient_preds,
+                per_patient_labels,
+                per_patient_probs,
+                all_paths,
+                patient_result,
+                threshold
+            )
+        
+        results.update(classifier_metrics)
+        
+        return results
+
+
+    def _build_reference_set(self, train_ds, max_ref_samples=None):
+        #EDITED triplet mode to classifer mode 
+        """Build reference set from training data for KNN"""
+        print("Building reference set from training data...")
+        
+        X_ref, Y_ref = [], []
+        loader = DataLoader(train_ds, batch_size=128, shuffle=False)
+        self.model_engine.model.eval()
+        with torch.no_grad():
+            for (mels, labels, _) in loader:
+                # preprocess & forward through encoder
+                
+                embs = self.model_engine.model.model.forward_encoder_nomasking(mels.to(self.model_engine.device).float())
+                X_ref.extend(embs.cpu().numpy())
+                Y_ref.extend(labels.cpu().numpy())
+                if max_ref_samples and len(X_ref) >= max_ref_samples:
+                    break
+
+        X_ref = np.stack(X_ref)[:max_ref_samples]
+        Y_ref = np.array(Y_ref)[:max_ref_samples]
+        return X_ref, Y_ref
+
+    
+    def evaluate_reference_thresholds(self, train_ds, max_ref_samples=None):
+        # TODO: may be in step 2. If we want to use classifier mode, we get good embedding and bad embeddings
+        # And shuffle good embedding to get anchor embeddings
+        ref_loader = DataLoader(train_ds, batch_size=128, shuffle=False, num_workers=0)
+        all_labels = []
+        all_embs = []
+        
+        with torch.no_grad():
+            for batch in tqdm(ref_loader, desc="Building Average Thresholds"):
+                mels, labels, _ = batch
+                Embs = self.model_engine.model.model.forward_encoder_nomasking(mels.to(self.model_engine.device).float())
+                all_labels.extend(labels.cpu().numpy())
+                all_embs.extend(Embs.cpu().numpy() )
+                
+                if max_ref_samples and len(all_embs) >= max_ref_samples:
+                    break
+
+            
+            all_embs = np.vstack(all_embs) #(N,D) 
+            all_labels = np.array(all_labels) #(N,)
+            
+            emb_p = all_embs[all_labels == 1]
+            emb_n = all_embs[all_labels == 0]
+            emb_a = emb_p.copy()
+            np.random.shuffle(emb_a)
+            
+            emb_a_truncated = emb_a[:len(emb_n)]
+                
+            d_pos = np.linalg.norm(emb_a - emb_p, axis=1)
+            d_neg = np.linalg.norm(emb_a_truncated - emb_n, axis=1)
+            
+            Mean_Pos_th = d_pos.mean()
+            Std_Pos_th = d_pos.std()
+            Mean_Neg_th = d_neg.mean()
+            Std_Neg_th = d_neg.std()
+            
+        return Mean_Pos_th, Std_Pos_th, Mean_Neg_th, Std_Neg_th, all_embs, all_labels 
+        
+    def compute_classifier_statistics(self, all_predictions, all_labels, all_probabilities,
+                                     per_patient_predictions, per_patient_labels, per_patient_probabilities,
+                                     all_file_paths, patient_result, threshold):
+        """
+        Computes and aggregates statistics for classifier evaluation.
+        """
         # Calculate comprehensive metrics
         all_predictions = np.array(all_predictions)
         all_labels = np.array(all_labels)
@@ -405,31 +423,10 @@ class AudioEvaluator:
         
         if patient_result:
             respective_patient_accuracy = []
-            # per_patient_labels = []
-            # per_patient_predictions = []
-            
-            # unique_patients = np.unique(patient_ids)
-            # # print(f"unique_patients: {unique_patients}")
-            
-            # patient_files = {pid: [] for pid in unique_patients}
-            # # print(f"patient_files: {patient_files}")
-            # for patient in unique_patients:
-            #     tmp = []
-            #     for idx, id in enumerate(patient_ids):
-            #         if id == patient:
-            #             tmp.append(idx)
-            #     patient_files[patient] = tmp
-                
-            # # print(f"patient_files: {patient_files}")
-                
-            # for patient, idxs in patient_files.items():
+
             p_labels = []
             p_predictions = []
             p_probabilities = []
-
-            # print (f"per_patient_predictions: {per_patient_predictions.keys()}")
-            # print (f"per_patient_labels: {per_patient_labels.keys()}")
-            # print (f"per_patient_probabilities: {per_patient_probabilities.keys()}")
 
             
             for patient_id in per_patient_predictions.keys():
@@ -443,14 +440,13 @@ class AudioEvaluator:
                     
                 patient_probabilities = per_patient_probabilities[patient_id]
                 
-                patient_accuracy = 1 if np.mean(patient_predictions == patient_labels) > 0.5 else 0
-                respective_patient_accuracy.append(patient_accuracy)
+                # patient_accuracy = 1 if np.mean(patient_predictions == patient_labels) > threshold else 0
                     
                 if np.mean(patient_predictions) > threshold:
-                    p_predictions.append(1)
-                    
+                    pred = 1
                 else:
-                    p_predictions.append(0)
+                    pred = 0
+                p_predictions.append(pred)
                 
                 # Average only the positive class probability (index 1) for ROC curve
                 # Validate probability structure
@@ -460,14 +456,15 @@ class AudioEvaluator:
                 positive_probs = [prob[1] for prob in patient_probabilities]
                 p_probabilities.append(np.mean(positive_probs))
                 p_labels.append(patient_labels[0])
+                respective_patient_accuracy.append(pred == patient_labels[0])
+
                     
 
             total_patient_accuracy = np.mean(respective_patient_accuracy)
-            #print(f"total_patient_accuracy: {total_patient_accuracy}")
+            # print(f"total_patient_accuracy: {total_patient_accuracy}, {respective_patient_accuracy} {p_labels == p_predictions}")
             
         accuracy = np.mean(all_predictions == all_labels)
         if patient_result:
-            # print (f"File wise accuracy: {accuracy} \n Patient wise accuracy: {total_patient_accuracy} \n all_predictions: {per_patient_predictions}  \n all_labels: {per_patient_labels}")
             print (f"File wise accuracy: {accuracy} \n Patient wise accuracy: {total_patient_accuracy} (threshold: {threshold})")
         else:
             print (f"File wise accuracy: {accuracy}")
@@ -489,10 +486,6 @@ class AudioEvaluator:
         # Balanced accuracy (average of per-class accuracy)
         balanced_accuracy = np.mean(list(per_class_accuracy.values())) #overall accuracy 
         
-        # Calculate sensitivity and specificity
-        # Assuming: 0 = Bad (Negative), 1 = Good (Positive)
-        # Sensitivity = TP / (TP + FN) = Recall for positive class
-        # Specificity = TN / (TN + FP) = Recall for negative class
         
         # Confusion matrix values
         cm = confusion_matrix(all_labels, all_predictions)
@@ -524,19 +517,27 @@ class AudioEvaluator:
         precision, recall, _ = precision_recall_curve(all_labels, all_probabilities[:, 1])
         avg_precision = average_precision_score(all_labels, all_probabilities[:, 1])
         
+        result = {
+        'accuracy': accuracy,
+        'balanced_accuracy': balanced_accuracy,
+        'sensitivity': sensitivity,
+        'specificity': specificity,
+        'per_class_accuracy': per_class_accuracy,
+        'per_class_counts': per_class_counts,
+        'classification_report': report,
+        'confusion_matrix': cm,
+        'roc_curve': {'fpr': fpr, 'tpr': tpr, 'auc': roc_auc},
+        'pr_curve': {'precision': precision, 'recall': recall, 'avg_precision': avg_precision},
+        'predictions': all_predictions,
+        'labels': all_labels,
+        'probabilities': all_probabilities,
+        }
+
         if patient_result:
-            # Calculate patient-level confusion matrix and metrics
-            # patient_predictions = []
-            # patient_labels = []
-            
-            # for patient, idxs in patient_files.items():
-            #     patient_label = all_labels[idxs[0]]  # All samples for a patient have same label
-            #     # Use probabilities instead of binary predictions for patient-level decision
-            #     patient_prob = np.mean(all_probabilities[idxs, 1])  # Average probability for positive class
-            #     patient_prediction = 1 if patient_prob > 0.5 else 0
-            #     patient_predictions.append(patient_prediction)
-            #     patient_labels.append(patient_label)
-            
+            # idxs = []
+            # for idx in p_predictions: 
+            #     if idx >= 0.65 or idx <= 0.45: 
+            #         idxs.append(idx)
             p_predictions = np.array(p_predictions)
             p_labels = np.array(p_labels)
             
@@ -544,7 +545,7 @@ class AudioEvaluator:
             patient_cm = confusion_matrix(p_labels, p_predictions)
             
             # Patient-level metrics
-            if patient_cm.shape == (2, 2):
+            if patient_cm.shape == (2, 2):                           
                 tn, fp, fn, tp = patient_cm.ravel()
                 patient_sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
                 patient_specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
@@ -558,48 +559,9 @@ class AudioEvaluator:
                 target_names=class_names, 
                 output_dict=True
             )
-            
-            # Patient-level ROC curve
-            # patient_probabilities = []
-            # for patient, idxs in patient_files.items():
-            #     patient_prob = np.mean(all_probabilities[idxs, 1])  # Average probability for positive class
-            #     patient_probabilities.append(patient_prob)
-            
+           
             p_probabilities = np.array(p_probabilities)
-            
-            # Debug information
-            # print(f"\nPatient-level debugging info:")
-            # print(f"Number of patients: {len(p_labels)}")
-            # print(f"Patient labels: {p_labels}")
-            # print(f"Patient predictions: {p_predictions}")
-            # print(f"Patient probabilities: {p_probabilities}")
-            # print(f"Confusion matrix:\n{patient_cm}")
-            
-            # Additional debugging for label assignment
-            # print(f"\nDetailed patient analysis:")
-            # print(f"Total patients: {len(per_patient_predictions.keys())}")
-            # print(f"Patient IDs: {list(per_patient_predictions.keys())}")
-            
-            # Summary statistics
-            # total_bad_patients = sum(1 for lab in p_labels if lab == 0)
-            # total_good_patients = sum(1 for lab in p_labels if lab == 1)
-            # print(f"Total bad patients: {total_bad_patients}")
-            # print(f"Total good patients: {total_good_patients}")
-            
-            # for i, patient_id in enumerate(per_patient_predictions.keys()):
-            #     patient_preds = per_patient_predictions[patient_id]
-            #     patient_labs = per_patient_labels[patient_id]
-            #     patient_probs = per_patient_probabilities[patient_id]
-            #     print(f"Patient {patient_id}:")
-            #     print(f"  Individual predictions: {patient_preds}")
-            #     print(f"  Individual labels: {patient_labs}")
-            #     print(f"  Individual probabilities: {[prob[1] for prob in patient_probs]}")
-            #     print(f"  Patient-level prediction: {p_predictions[i]}")
-            #     print(f"  Patient-level label: {p_labels[i]}")
-            #     print(f"  Patient-level probability: {p_probabilities[i]:.4f}")
-            #     print(f"  Patient accuracy: {respective_patient_accuracy[i]}")
-            #     print()
-            
+                          
             p_fpr, p_tpr, _ = roc_curve(p_labels, p_probabilities)
             p_roc_auc = auc(p_fpr, p_tpr)
             
@@ -607,20 +569,7 @@ class AudioEvaluator:
             p_precision, p_recall, _ = precision_recall_curve(p_labels, p_probabilities)
             p_avg_precision = average_precision_score(p_labels, p_probabilities)
             
-            return {
-                'accuracy': accuracy,
-                'balanced_accuracy': balanced_accuracy,
-                'sensitivity': sensitivity,
-                'specificity': specificity,
-                'per_class_accuracy': per_class_accuracy,
-                'per_class_counts': per_class_counts,
-                'classification_report': report,
-                'confusion_matrix': cm,
-                'roc_curve': {'fpr': fpr, 'tpr': tpr, 'auc': roc_auc},
-                'pr_curve': {'precision': precision, 'recall': recall, 'avg_precision': avg_precision},
-                'predictions': all_predictions,
-                'labels': all_labels,
-                'probabilities': all_probabilities,
+            result.update({
                 'total_patient_accuracy': total_patient_accuracy,
                 # Patient-level results
                 'patient_predictions': p_predictions,
@@ -634,155 +583,68 @@ class AudioEvaluator:
                 'patient_probabilities': p_probabilities,
                 'patient_files': all_file_paths,
                 'unique_patients': list(per_patient_predictions.keys()),
-            }
-        else: 
-            return {
-                'accuracy': accuracy,
-                'balanced_accuracy': balanced_accuracy,
-                'sensitivity': sensitivity,
-                'specificity': specificity,
-                'per_class_accuracy': per_class_accuracy,
-                'per_class_counts': per_class_counts,
-                'classification_report': report,
-                'confusion_matrix': cm,
-                'roc_curve': {'fpr': fpr, 'tpr': tpr, 'auc': roc_auc},
-                'pr_curve': {'precision': precision, 'recall': recall, 'avg_precision': avg_precision},
-                'predictions': all_predictions,
-                'labels': all_labels,
-                'probabilities': all_probabilities,
-            }
+            })
+        return result 
     
-    def evaluate_triplet(self, test_ds, patient_result=False):
+    def evaluate_triplet(self, test_ds, patient_result=False, train_ds=None, threshold=0.5, run_mj=False, k = 5):
         """Evaluate triplet loss model performance."""
         print("Evaluating triplet loss model performance...")
         
-        test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=0)
-        
-        all_embeddings = []
-        all_labels = []
-        all_file_paths = []
-        
-        per_patient_embeddings = dict()
-        per_patient_labels = dict()
-        
+        # test_loader = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=0)
+                
         self.model_engine.model.eval()
         
-        with torch.no_grad():
-            for batch in tqdm(test_loader, desc="Extracting embeddings"):
-                if len(batch) == 3:  # anchor, positive, negative
-                    anchor, positive, negative = batch
-                    anchor = anchor.to(self.model_engine.device).float()
-                    
-                    embeddings = self.model_engine.model.model.forward_encoder_nomasking(anchor)
-                    all_embeddings.extend(embeddings.cpu().numpy())
-                    all_labels.extend([1] * len(embeddings))  # Assuming anchor samples are positive
-                else:  # single samples
-                    mel, labels, file_path = batch
-                    mel = mel.to(self.model_engine.device).float()
-                    
-                    embeddings = self.model_engine.model.model.forward_encoder_nomasking(mel)
-                    all_embeddings.extend(embeddings.cpu().numpy())
-                    all_labels.extend(labels.cpu().numpy())
-                    all_file_paths.extend(file_path)
-                    
-                    if patient_result:
-                        for f, emb, l in zip(file_path, embeddings.cpu().numpy(), labels.cpu().numpy()):
-                            patient_id = Path(f).stem.split('_')[1]
-                            if patient_id not in per_patient_embeddings:
-                                per_patient_embeddings[patient_id] = [emb]
-                                per_patient_labels[patient_id] = [l]
-                            else:
-                                if per_patient_labels[patient_id][-1] != l:
-                                    print(f"patient_id: {patient_id} \n embeddings shape: {embeddings.shape} \n labels: {labels.cpu().numpy()}")
-                                    assert False, "labels are not the same for patient"
-                                
-                                per_patient_embeddings[patient_id].append(emb)
-                                per_patient_labels[patient_id].append(l)
-        
-        all_embeddings = np.array(all_embeddings)
-        all_labels = np.array(all_labels)
-        
-        # Basic embedding statistics
-        embedding_stats = {
-            'mean_norm': np.mean(np.linalg.norm(all_embeddings, axis=1)),
-            'std_norm': np.std(np.linalg.norm(all_embeddings, axis=1)),
-            'mean_embedding': np.mean(all_embeddings, axis=0),
-            'std_embedding': np.std(all_embeddings, axis=0)
-        }
-        
+        Pdist_m, Pdist_std, Ndist_m, Ndist_std, X_ref, Y_ref = self.evaluate_reference_thresholds(train_ds=train_ds)
         result = {
-            'embeddings': all_embeddings,
-            'labels': all_labels,
-            'embedding_stats': embedding_stats
+            'positive_distance_mean':Pdist_m, 
+            'positive_distance_std':Pdist_std, 
+            'negative_distance_mean':Ndist_m,
+            'negative_distance_std':Ndist_std 
         }
         
-        # Add patient-level analysis if requested
-        if patient_result and len(all_file_paths) > 0:
-            p_embeddings = []
-            p_labels = []
-            
-            for patient_id in per_patient_embeddings.keys():
-                patient_embeddings = per_patient_embeddings[patient_id]
-                patient_labels = per_patient_labels[patient_id]
-                
-                if_all_labels_zero = np.all(np.array(patient_labels) == 0)
-                if_all_labels_one = np.all(np.array(patient_labels) == 1)
-                
-                assert if_all_labels_zero or if_all_labels_one, f"patient_id: {patient_id} {if_all_labels_zero} {if_all_labels_one} \n patient_labels should be either all 0 or all 1 {patient_labels}"
-                
-                # Average embeddings for this patient
-                avg_patient_emb = np.mean(patient_embeddings, axis=0)
-                p_embeddings.append(avg_patient_emb)
-                p_labels.append(patient_labels[0])
-            
-            p_embeddings = np.array(p_embeddings)
-            p_labels = np.array(p_labels)
-            
-            # Patient-level embedding statistics
-            patient_level_stats = {
-                'mean_norm': np.mean(np.linalg.norm(p_embeddings, axis=1)),
-                'std_norm': np.std(np.linalg.norm(p_embeddings, axis=1)),
-                'mean_embedding': np.mean(p_embeddings, axis=0),
-                'std_embedding': np.std(p_embeddings, axis=0)
-            }
-            
-            # Calculate patient-level statistics
-            patient_embedding_stats = {}
-            for patient_id in per_patient_embeddings.keys():
-                patient_emb = per_patient_embeddings[patient_id]
-                patient_embedding_stats[patient_id] = {
-                    'mean_norm': np.mean(np.linalg.norm(patient_emb, axis=1)),
-                    'std_norm': np.std(np.linalg.norm(patient_emb, axis=1)),
-                    'mean_embedding': np.mean(patient_emb, axis=0),
-                    'std_embedding': np.std(patient_emb, axis=0),
-                    'num_samples': len(patient_emb)
-                }
-            
-            result.update({
-                'patient_embeddings': per_patient_embeddings,
-                'patient_labels': per_patient_labels,
-                'patient_embedding_stats': patient_embedding_stats,
-                'avg_patient_embeddings': p_embeddings,
-                'avg_patient_labels': p_labels,
-                'patient_level_stats': patient_level_stats,
-                'unique_patients': list(per_patient_embeddings.keys()),
-                'patient_files': all_file_paths,
-            })
-            
-            # Debug information
-            # print(f"\nTriplet Patient-level debugging info:")
-            # print(f"Number of patients: {len(per_patient_embeddings.keys())}")
-            # print(f"Patient labels: {p_labels}")
-            # print(f"Bad patients: {np.sum(p_labels == 0)}")
-            # print(f"Good patients: {np.sum(p_labels == 1)}")
+        # # TODO: Run above for test_ds and return test embeddings
         
+        # with torch.no_grad():
+        #     for batch in tqdm(test_loader, desc="Extracting positive and negative embeddings"):
+        #         if len(batch) == 3:  # anchor, positive, negative
+        #             mels, labels, _ = batch
+        #             embs = self.model_engine.model.model.forward_encoder_nomasking(mels.to(self.model_engine.device).float())
+        #             embs = embs.cpu().numpy() 
+        #             labels = labels.cpu().numpy()
+
+
+        #             if False: 
+        #                 d_pos = (embeddings_a - embeddings_p).norm(dim=1)
+        #                 d_neg = (embeddings_a - embeddings_n).norm(dim=1)    
+                    
+        
+        # # Calculate embedding statistics
+        # embedding_stats = {
+        #     'mean_norm': np.mean(np.linalg.norm(embs, axis=1)),
+        #     'std_norm': np.std(np.linalg.norm(embs, axis=1)),
+        #     'mean_embedding': np.mean(embs, axis=0),
+        #     'std_embedding': np.std(embs, axis=0)
+        # }
+        
+        # result.update({
+        #     'embedding_stats': embedding_stats,
+        #     'embeddings':embs,
+        #     'labels':labels,
+        #     'file_paths': len(_)
+        #     })
+        
+        # X_ref, Y_ref = self._build_reference_set(train_ds)
+        # VA: Changed
+        kmeans_res = self.evaluate_kMeansCluster(test_ds, X_ref, Y_ref, n_clusters=10, threshold=threshold, patient_result=patient_result, run_mj=run_mj, K=k)
+        result.update(kmeans_res)
+                
         return result
     
     def evaluate_autoencoder(self, test_ds):
         """Evaluate autoencoder performance."""
         print("Evaluating autoencoder performance...")
         
-        test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=4)
+        test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=0)
         
         all_losses = []
         
@@ -804,7 +666,88 @@ class AudioEvaluator:
             'all_losses': all_losses
         }
     
-    def run_evaluation(self, patient_result=False, threshold=0.55):
+    def extract_patient_predictions(
+    self,
+    file_path, predictions, labels, probabilities,
+    per_patient_predictions, per_patient_labels, per_patient_probabilities):
+        """Extracts patient-level predictions, but only if confidence ∉ [0.3, 0.7]."""
+        for f, p, l, pr in zip(file_path, predictions, labels, probabilities):
+            # 1) only keep confident predictions
+            conf = pr[p]  # confidence of the predicted class
+
+            # 2) derive patient_id as before
+            try:
+                filename = Path(f).stem
+                if '_' in filename:
+                    patient_id = filename.split('_')[1]
+                else:
+                    patient_id = next(
+                        (part for part in Path(f).parts
+                        if part.startswith('R2D2') or (len(part) > 8 and part.isalnum())),
+                        filename
+                    )
+            except Exception:
+                patient_id = Path(f).stem
+
+            # 3) append into your per-patient dicts
+            if patient_id not in per_patient_predictions:
+                per_patient_predictions[patient_id]   = [p]
+                per_patient_labels[patient_id]         = [l]
+                per_patient_probabilities[patient_id] = [pr]
+            else:
+                # sanity check that labels stay consistent:
+                assert per_patient_labels[patient_id][-1] == l, \
+                    f"Mismatched label for {patient_id}: {l} vs {per_patient_labels[patient_id][-1]}"
+                per_patient_predictions[patient_id].append(p)
+                per_patient_labels[patient_id].append(l)
+                per_patient_probabilities[patient_id].append(pr)
+
+
+    def evaluate_classifier(self, test_ds, patient_result=False, threshold=0.55):
+        """Evaluate classifier performance."""
+        print("Evaluating classifier performance...")
+        test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=0)
+        all_predictions = []
+        all_labels = []
+        all_probabilities = []
+        per_patient_predictions = dict()
+        per_patient_labels = dict()
+        per_patient_probabilities = dict()
+        self.model_engine.model.eval()
+        all_file_paths = []
+        with torch.no_grad():
+            for batch in tqdm(test_loader, desc="Evaluating"):                
+                if self.mode == 'classifier':
+                    mel, labels, file_path = batch
+                    mel = mel.to(self.model_engine.device).float()  # Ensure float32 precision
+                    labels = labels.to(self.model_engine.device)
+                    
+                    logits = self.model_engine.model.model.forward_encoder_nomasking_classification(mel)
+                    probabilities = F.softmax(logits, dim=1)
+                    predictions = torch.argmax(logits, dim=1)
+                    
+                    labels = labels.cpu().tolist()
+                    predictions = predictions.cpu().tolist()
+                    probabilities = probabilities.cpu().tolist()
+                    
+                    all_predictions.extend(predictions)
+                    all_labels.extend(labels)
+                    all_probabilities.extend(probabilities)
+                    all_file_paths.extend(file_path)
+                    
+                    if patient_result:
+                        self.extract_patient_predictions(
+                            file_path, predictions, labels, probabilities,
+                            per_patient_predictions, per_patient_labels, per_patient_probabilities
+                        )
+
+        return self.compute_classifier_statistics(
+            all_predictions, all_labels, all_probabilities,
+            per_patient_predictions, per_patient_labels, per_patient_probabilities,
+            all_file_paths, patient_result, threshold
+        )
+    
+    def run_evaluation(self, patient_result=False, train_dataset = None, threshold=0.55, run_mj = False, K=5):
         """Run complete evaluation."""
         print(f"Starting evaluation for {self.mode} mode...")
         
@@ -816,13 +759,13 @@ class AudioEvaluator:
         if self.mode == 'classifier':
             self.results = self.evaluate_classifier(test_ds, patient_result, threshold)
         elif self.mode == 'tripletloss':
-            self.results = self.evaluate_triplet(test_ds, patient_result)
+            self.results = self.evaluate_triplet(test_ds, patient_result, train_ds=train_dataset, threshold=threshold, run_mj=run_mj, k=K)
         elif self.mode == 'auto':
             self.results = self.evaluate_autoencoder(test_ds)
         
         return self.results
     
-    def generate_report(self, output_dir='evaluation_results', threshold=0.55):
+    def generate_report(self, output_dir='evaluation_results',file_prefix = "default", threshold=0.55):
         """Generate comprehensive evaluation report."""
         if self.results is None:
             print("No evaluation results available. Run evaluation first.")
@@ -831,11 +774,19 @@ class AudioEvaluator:
         os.makedirs(output_dir, exist_ok=True)
         
         # Save results as JSON
-        results_file = os.path.join(output_dir, f'{self.mode}_evaluation_results.json')
+        results_file = os.path.join(output_dir, f'{self.mode}_{file_prefix}_evaluation_results.json')
         
         # Convert all numpy types to JSON-serializable
         # cm = results['confusion_matrix']
-        json_results = convert_numpy_types(self.results)
+        
+        filtered = dict(self.results)
+        filtered.pop('embeddings', None)
+        filtered.pop('labels', None)
+        filtered.pop('mean_embedding', None)
+        filtered.pop('predictions', None)
+        filtered.pop('probabilities', None)
+
+        json_results = convert_numpy_types(filtered)
         
         with open(results_file, 'w') as f:
             json.dump(json_results, f, indent=2)
@@ -850,7 +801,11 @@ class AudioEvaluator:
                 self._plot_patient_results(output_dir)
         elif self.mode == 'tripletloss':
             self._plot_triplet_results(output_dir)
-        elif self.mode == 'auto':
+            self._plot_classifier_results(output_dir, threshold)
+            # If patient results are available, also plot patient-level results
+            if 'patient_confusion_matrix' in self.results:
+                self._plot_patient_results(output_dir)
+        elif self.mode == 'auto': 
             self._plot_autoencoder_results(output_dir)
     
     def _plot_classifier_results(self, output_dir, threshold=0.55):
@@ -1007,6 +962,47 @@ class AudioEvaluator:
             f.write(f"Std norm: {results['embedding_stats']['std_norm']:.4f}\n")
             f.write(f"Number of embeddings: {len(results['embeddings'])}\n")
         
+        # t-SNE visualization
+        print(f"t-SNE debug: embeddings shape: {results['embeddings'].shape}")
+        print(f"t-SNE debug: embeddings sample: {results['embeddings'][:2]}")
+        print(f"t-SNE debug: embeddings min/max: {np.min(results['embeddings']):.6f}, {np.max(results['embeddings']):.6f}")
+        print(f"t-SNE debug: embeddings has NaN: {np.isnan(results['embeddings']).any()}")
+        print(f"t-SNE debug: number of embeddings: {len(results['embeddings'])}")
+        
+        if len(results['embeddings']) > 1:
+            try:
+                plt.figure(figsize=(10, 8))
+                tsne = TSNE(n_components=2, perplexity=min(30, len(results['embeddings'])-1), random_state=42)
+                embeddings_2d = tsne.fit_transform(results['embeddings'])
+                
+                # Color by labels if available
+                if 'labels' in results and len(results['labels']) == len(results['embeddings']):
+                    colors = ['darkred' if label == 1 else 'darkblue' for label in results['labels']]
+                    plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], c=colors, alpha=0.7, s=50)
+                    plt.title('t-SNE Visualization of Triplet Embeddings')
+                    plt.xlabel('t-SNE Dimension 1')
+                    plt.ylabel('t-SNE Dimension 2')
+                    
+                    # Add legend
+                    from matplotlib.patches import Patch
+                    legend_elements = [Patch(facecolor='darkred', label='Good'),
+                                     Patch(facecolor='darkblue', label='Bad')]
+                    plt.legend(handles=legend_elements)
+                else:
+                    plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], alpha=0.7, s=50)
+                    plt.title('t-SNE Visualization of Triplet Embeddings')
+                    plt.xlabel('t-SNE Dimension 1')
+                    plt.ylabel('t-SNE Dimension 2')
+                
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, 'tsne_embeddings.png'), dpi=300, bbox_inches='tight')
+                plt.close()
+            except Exception as e:
+                import traceback
+                print(f"Warning: Could not create t-SNE visualization: {e}")
+                traceback.print_exc()
+        
         # If patient-level results are available, also plot patient-level results
         if 'avg_patient_embeddings' in results:
             self._plot_triplet_patient_results(output_dir)
@@ -1067,6 +1063,41 @@ class AudioEvaluator:
         plt.savefig(os.path.join(output_dir, 'patient_vs_sample_stats.png'), dpi=300, bbox_inches='tight')
         plt.close()
         
+        # Patient-level t-SNE visualization
+        print(f"Patient t-SNE debug: embeddings shape: {results['avg_patient_embeddings'].shape}")
+        print(f"Patient t-SNE debug: embeddings sample: {results['avg_patient_embeddings'][:2]}")
+        print(f"Patient t-SNE debug: embeddings min/max: {np.min(results['avg_patient_embeddings']):.6f}, {np.max(results['avg_patient_embeddings']):.6f}")
+        print(f"Patient t-SNE debug: embeddings has NaN: {np.isnan(results['avg_patient_embeddings']).any()}")
+        print(f"Patient t-SNE debug: number of embeddings: {len(results['avg_patient_embeddings'])}")
+        
+        if len(results['avg_patient_embeddings']) > 1:
+            try:
+                plt.figure(figsize=(10, 8))
+                tsne = TSNE(n_components=2, perplexity=min(30, len(results['avg_patient_embeddings'])-1), random_state=42)
+                patient_embeddings_2d = tsne.fit_transform(results['avg_patient_embeddings'])
+                
+                # Color by patient labels
+                colors = ['darkred' if label == 1 else 'darkblue' for label in results['avg_patient_labels']]
+                plt.scatter(patient_embeddings_2d[:, 0], patient_embeddings_2d[:, 1], c=colors, alpha=0.7, s=100)
+                plt.title('t-SNE Visualization of Patient-Level Triplet Embeddings')
+                plt.xlabel('t-SNE Dimension 1')
+                plt.ylabel('t-SNE Dimension 2')
+                
+                # Add legend
+                from matplotlib.patches import Patch
+                legend_elements = [Patch(facecolor='darkred', label='Good Patients'),
+                                 Patch(facecolor='darkblue', label='Bad Patients')]
+                plt.legend(handles=legend_elements)
+                
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, 'tsne_patient_embeddings.png'), dpi=300, bbox_inches='tight')
+                plt.close()
+            except Exception as e:
+                import traceback
+                print(f"Warning: Could not create patient-level t-SNE visualization: {e}")
+                traceback.print_exc()
+        
         # Save patient-level embedding statistics
         stats_file = os.path.join(output_dir, 'patient_embedding_statistics.txt')
         with open(stats_file, 'w') as f:
@@ -1091,6 +1122,8 @@ class AudioEvaluator:
                 f.write(f"  Std norm: {stats['std_norm']:.4f}\n")
                 f.write(f"  Number of samples: {stats['num_samples']}\n")
                 f.write(f"  Label: {'Good' if results['patient_labels'][patient][0] == 1 else 'Bad'}\n\n")
+                
+        
         
         print(f"Triplet patient-level plots saved to {output_dir}")
     
@@ -1262,16 +1295,18 @@ def convert_numpy_types(obj):
 
 def main():
     """Main function for running inference and evaluation."""
+    required_bool = False
+    
     parser = argparse.ArgumentParser(description="Audio Model Inference and Evaluation")
-    parser.add_argument('--mode', type=str, required=True, 
+    parser.add_argument('--mode', type=str, required=required_bool, 
                        choices=['auto', 'classifier', 'tripletloss'],
                        help='Model mode')
     parser.add_argument('--config', type=str, default="default_config.yaml", help='Path to YAML config file')
-    parser.add_argument('--checkpoint_path', type=str, required=True,
+    parser.add_argument('--checkpoint_path', type=str, required=required_bool,
                        help='Path to model checkpoint')
     parser.add_argument('--threshold', type=float, default=0.55,
                        help='Threshold for patient-level prediction (default: 0.55)')
-    parser.add_argument('--data_path', type=str, required=True,
+    parser.add_argument('--data_path', type=str, required=required_bool,
                        help='Path to test data directory')
     parser.add_argument('--train_data_path', type=str, help='Path to training data directory (for KNN reference)')
     parser.add_argument('--output_dir', type=str, default='evaluation_results',
@@ -1284,40 +1319,83 @@ def main():
     parser.add_argument('--inference_only', action='store_true',
                        help='Run only inference, skip evaluation')
     parser.add_argument('--patient_result', action='store_true', help='windowed results averaged per patient')
-    parser.add_argument('--run_knn', action='store_true', help='Run KNN evaluation')  #. added
-    parser.add_argument('--K', type=int, default=5, help='Number of nearest neighbors for KNN')  #. added    
+    parser.add_argument('--run_knn_MJ', action='store_true', help='Run KNN evaluation')  #. added
+    parser.add_argument('--K', type=int, default=5, help='Number of nearest neighbors for KNN using Majority Rule')  #. added
+    parser.add_argument('--max_ref_samples', type=int, default=None, help='Maximum number of reference samples for KNN (faster evaluation)')    
+    parser.add_argument('--evaluate_using_dir', type=str)
     args = parser.parse_args()
-    
+
     config = load_config(args.config, args)
 
     # paths = get_output_paths(config.get('prefix', ''), config.get('base_path', '.'))
     model_params = config.get('model', {})
     
+    if args.evaluate_using_dir: 
+        current_max_val = 0
+        current_max_epoch = None
+        for ckpt in os.listdir(os.path.join(args.evaluate_using_dir, 'checkpoints')): 
+            txt = ckpt.split('acc=')
+            val_acc = (txt[2]).split('.ckpt')
+            if float(val_acc[0]) >= current_max_val: 
+                current_max_val = float(val_acc[0])
+                current_max_epoch = os.path.join(args.evaluate_using_dir, 'checkpoints',ckpt)
+        yaml_file = os.path.join(args.evaluate_using_dir, 'logs', 'config_used.yaml')
+        with open(yaml_file, 'r') as file: 
+            data = yaml.safe_load(file)
+        
+        base_dir = None
+        base_path = None
+        batch_size = None 
+        mode_type = None 
+        train_data_path = None
+        for key, value in data.items(): 
+            base_dir = os.path.join(value,'test') if key == 'base_dir' else base_dir
+            train_data_path = os.path.join(value,'train') if key == 'base_dir' else train_data_path
+            base_path = value if key == 'base_path' else base_path
+            batch_size = value if key == 'batch_size' else batch_size
+            mode_type = value if key == 'mode_type' else mode_type
+        checkpoint = current_max_epoch
+        assert base_dir is not None, "config_used.yaml doesn't contain a data path (base_dir)"
+        assert mode_type is not None, "config_used.yaml doesn't contain a mode type (mode_type)"
+    else: 
+        try: 
+            checkpoint=args.checkpoint_path
+            mode_type = args.mode
+            base_dir = args.data_path  
+            train_data_path = None
+            if args.mode == 'tripletloss': 
+                if args.train_data_path is None:
+                    raise ValueError('need train data path for triplet mode')
+                train_data_path = args.train_data_path
+        except Exception as e: 
+            print('must use --checkpoint_path , --mode, --data_path')
+            raise e
+    
     # Initialize inference engine
     print("Loading model...")
     engine = AudioInferenceEngine(
-        checkpoint_path=args.checkpoint_path,
-        mode=args.mode,
+        checkpoint_path=checkpoint,
+        mode=mode_type,
         model_params=model_params,
         device=args.device
     )
     
     if args.inference_only:
         # Run inference on single file or directory
-        if os.path.isfile(args.data_path):
+        if os.path.isfile(base_dir):
             # Single file inference
-            result = engine.predict_single(args.data_path)
+            result = engine.predict_ifiles(base_dir, 1)
             if result:
-                print(f"Prediction for {args.data_path}:")
+                print(f"Prediction for {base_dir}:")
                 print(json.dumps(convert_numpy_types(result), indent=2))
         else:
             # Directory inference
             audio_files = []
             for ext in ['*.pt']:
-                audio_files.extend(Path(args.data_path).rglob(ext))
+                audio_files.extend(Path(base_dir).rglob(ext))
             
             if audio_files:
-                results = engine.predict_batch([str(f) for f in audio_files], args.batch_size)
+                results = engine.predict_ifiles([str(f) for f in audio_files], args.batch_size if batch_size is None else batch_size)
                 
                 # Save results
                 os.makedirs(args.output_dir, exist_ok=True)
@@ -1328,36 +1406,45 @@ def main():
                 
                 print(f"Inference results saved to {results_file}")
             else:
-                print(f"No .pt files found in {args.data_path}")
+                print(f"No .pt files found in {base_dir}")
     else:
         # Run full evaluation
         # Run full evaluation
         print("Running evaluation...")
-        evaluator = AudioEvaluator(engine, args.data_path, args.mode)
+        evaluator = AudioEvaluator(engine, base_dir, mode_type)
 
-        # If requested, run KNN before the standard evaluation
-        if args.run_knn:
-            # build a classifier‐style reference set
+        if mode_type == 'tripletloss':
+            # Check if train_data_path is available
+            if train_data_path is None:
+                raise ValueError("train_data_path is required for tripletloss mode but was not provided")
+            
+            # Solved: Change data mode
             train_ds = AudioDataset(
                 mode='classifier',
-                data_dir_good=[os.path.join(args.train_data_path, 'good')],
-                data_dir_bad =[os.path.join(args.train_data_path, 'bad')],
-                apply_specaugment=False,
-                shuffle=False
+                data_dir_good=[os.path.join(train_data_path, 'good')],
+                data_dir_bad=[os.path.join(train_data_path, 'bad')],
             )
-            test_ds = evaluator.load_test_data()
-            knn_res = evaluator.run_knn(train_ds, test_ds, K=args.K)
-            print(f"KNN evaluation result: {knn_res}")
-
-
-        results = evaluator.run_evaluation(args.patient_result, args.threshold)
-        
+            results = evaluator.run_evaluation(
+                patient_result=args.patient_result,
+                train_dataset=train_ds,
+                threshold=args.threshold,
+                run_mj= args.run_knn_MJ, 
+                K = args.K
+            )
+        else:
+            results = evaluator.run_evaluation(
+                patient_result=args.patient_result,
+                train_dataset=None,
+                threshold=args.threshold
+            )      
+              
         # Generate detailed report and plots
         print(f"\nGenerating detailed evaluation report...")
-        evaluator.generate_report(args.output_dir, args.threshold)
+        evaluator.generate_report(args.output_dir, "default", args.threshold)
         
         # Print summary
-        if results is not None and args.mode == 'classifier':
+        # FIXME: Print this 
+        if results is not None and (mode_type == 'classifier' or (mode_type == 'tripletloss' and not args.run_knn_MJ)):
             print(f"\n=== CLASSIFIER EVALUATION SUMMARY ===")
             print(f"Overall Accuracy: {results['accuracy']:.4f}")
             print(f"Balanced Accuracy: {results['balanced_accuracy']:.4f}")
@@ -1390,7 +1477,6 @@ def main():
                 
                 print(f"\nPatient-Level Confusion Matrix:")
                 print(results['patient_confusion_matrix'])
-                
                 print(f"\nPatient-Level Classification Report:")
                 print(classification_report(results['patient_labels'], results['patient_predictions'], 
                                           target_names=['Bad', 'Good']))
@@ -1409,34 +1495,27 @@ def main():
                         print(f"    Recall: {metrics['recall']:.4f}")
                         print(f"    F1-Score: {metrics['f1-score']:.4f}")
                         print(f"    Support: {metrics['support']}")
-        elif results is not None and args.mode == 'tripletloss':
+        
+        # CHANGED: print this for tripletloss mode anyway                
+        if results is not None and mode_type == 'tripletloss':
             print(f"\nTriplet Loss Evaluation Summary:")
             print(f"Mean embedding norm: {results['embedding_stats']['mean_norm']:.4f}")
             print(f"Std embedding norm: {results['embedding_stats']['std_norm']:.4f}")
-            print(f"Number of embeddings: {len(results['embeddings'])}")
-            
-            if args.patient_result and results is not None and 'avg_patient_embeddings' in results:
-                print(f"\n=== TRIPLET LOSS PATIENT-LEVEL EVALUATION RESULTS ===")
-                print(f"Number of patients: {len(results['unique_patients'])}")
-                print(f"Patient-level mean embedding norm: {results['patient_level_stats']['mean_norm']:.4f}")
-                print(f"Patient-level std embedding norm: {results['patient_level_stats']['std_norm']:.4f}")
-                print(f"Number of bad patients: {np.sum(results['avg_patient_labels'] == 0)}")
-                print(f"Number of good patients: {np.sum(results['avg_patient_labels'] == 1)}")
                 
-                # Calculate separation between bad and good patients
-                bad_patient_norms = np.linalg.norm(results['avg_patient_embeddings'][results['avg_patient_labels'] == 0], axis=1)
-                good_patient_norms = np.linalg.norm(results['avg_patient_embeddings'][results['avg_patient_labels'] == 1], axis=1)
-                
-                if len(bad_patient_norms) > 0 and len(good_patient_norms) > 0:
-                    print(f"Bad patients - mean norm: {np.mean(bad_patient_norms):.4f}, std: {np.std(bad_patient_norms):.4f}")
-                    print(f"Good patients - mean norm: {np.mean(good_patient_norms):.4f}, std: {np.std(good_patient_norms):.4f}")
-                    
-                    # Calculate separation metric
-                    separation = abs(np.mean(good_patient_norms) - np.mean(bad_patient_norms)) / (np.std(good_patient_norms) + np.std(bad_patient_norms))
-                    print(f"Separation between patient groups: {separation:.4f}")
-    
+            print("=============Stats that matter=============")
+            print(f"Positive mean distances from anchor {results['positive_distance_mean']}")
+            print(f"Positive std distances from anchor {results['positive_distance_std']}")
+            print(f"Negative mean distances from anchor {results['negative_distance_mean']}")
+            print(f"Negative std distances from anchor {results['negative_distance_std']}")
+            print(f"\n")
+            # print(f"Test Positive mean distances from anchor {results['test_positive_distance_mean']}")
+            # print(f"Test Positive std distances from anchor {results['test_positive_distance_std']}")
+            # print(f"Test Negative mean distances from anchor {results['test_negative_distance_mean']}")
+            # print(f"Test Negative std distances from anchor {results['test_negative_distance_std']}")
+            # print(f"\n")
+            print(f"Kmeans Cluster Accuracy: {results['Kmeans_cluster_accuracy']}")
 
-        elif results is not None and args.mode == 'auto':
+        elif results is not None and mode_type == 'auto':
             print(f"\nAutoencoder Evaluation Summary:")
             print(f"Mean reconstruction loss: {results['mean_loss']:.4f}")
             print(f"Std reconstruction loss: {results['std_loss']:.4f}")
