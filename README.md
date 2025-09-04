@@ -1,4 +1,5 @@
-TB-Classification
+##TB-Classification
+
 TB classification using AudioMAE Facebook
 Unified Lightning Training Script
 This repository provides a unified PyTorch Lightning training script that supports three modes:
