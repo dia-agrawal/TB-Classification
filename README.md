@@ -32,6 +32,6 @@ This repository provides a unified PyTorch Lightning training script that suppor
 It builds on Facebook’s AudioMAE implementation of Masked Autoencoders for audio, extending it with classification and triplet loss workflows.
 
 ### Before using Lightning Combined to train: 
-Reference the lightning combined help file for customizable training through the CLI 
+Reference the "lightning combined help" file for customizable training through the CLI 
 ### Before using inference evaluation to evaluate or infer: 
-Use the example usage file for customizable evaluation or inference through the CLI 
+Use the "example usage" file for customizable evaluation or inference through the CLI 
